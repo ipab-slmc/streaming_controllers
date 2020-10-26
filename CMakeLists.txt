@@ -10,15 +10,13 @@ find_package(catkin REQUIRED COMPONENTS
   realtime_tools
   pluginlib
   urdf
+  ddynamic_reconfigure
 )
 
 find_package(Eigen3 REQUIRED)
 
 catkin_package(
-  INCLUDE_DIRS include
-  LIBRARIES ${PROJECT_NAME}
-  CATKIN_DEPENDS controller_interface hardware_interface std_msgs realtime_tools pluginlib urdf
-  
+  INCLUDE_DIRS include  
 )
 
 include_directories(
@@ -34,7 +32,7 @@ target_link_libraries(${PROJECT_NAME} ${catkin_LIBRARIES})
 
 add_dependencies(${PROJECT_NAME} ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 
-install(DIRECTORY include/${PROJECT_NAME}/
+install(FILES include/${PROJECT_NAME}/validity_checker.h
   DESTINATION ${CATKIN_PACKAGE_INCLUDE_DESTINATION})
 
 install(TARGETS ${PROJECT_NAME}

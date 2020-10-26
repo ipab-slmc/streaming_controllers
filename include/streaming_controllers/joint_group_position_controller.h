@@ -10,7 +10,11 @@
 #include <controller_interface/controller.h>
 #include <std_msgs/Float64MultiArray.h>
 #include <realtime_tools/realtime_buffer.h>
-#include <pluginlib/class_list_macros.hpp>
+#include <pluginlib/class_loader.h>
+#include <pluginlib/class_list_macros.h>
+#include <ddynamic_reconfigure/ddynamic_reconfigure.h>
+
+#include <streaming_controllers/validity_checker.h>
 
 namespace streaming_controllers
 {
@@ -24,7 +28,7 @@ public:
         CMD_ACCELERATION,
     };
 
-    JointGroupPositionController() = default;
+    JointGroupPositionController() : validity_checkers_("streaming_controllers", "streaming_controllers::ValidityChecker") {};
     ~JointGroupPositionController();
 
     bool init(hardware_interface::PositionJointInterface* hw, ros::NodeHandle &n);
@@ -38,6 +42,7 @@ public:
 
     void limit_position_command(const std::vector<double>& desired_position, std::vector<double>& position_command, std::vector<double>& velocity_command);
     void limit_velocity_command(const std::vector<double>& desired_velocity, std::vector<double>& position_command, std::vector<double>& velocity_command);
+    bool is_valid(const std::vector<double>& old_position, const std::vector<double>& new_posiiton);
 
     std::vector< std::string > joint_names_;
     std::vector< hardware_interface::JointHandle > joints_;
@@ -67,7 +72,6 @@ public:
     double dt_;
     double k_p_;
     double k_d_;
-    double velocity_alpha_;
 
 private:
     ros::Subscriber sub_command_position_;
@@ -78,6 +82,35 @@ private:
     void acceleration_command_callback(const std_msgs::Float64MultiArrayConstPtr& msg);
     std::mutex command_mutex_;
     ros::NodeHandle nh_;
+    std::shared_ptr<ddynamic_reconfigure::DDynamicReconfigure>  ddr_;
+    pluginlib::ClassLoader<streaming_controllers::ValidityChecker> validity_checkers_;
+    std::shared_ptr<streaming_controllers::ValidityChecker> validity_checker_;
 };
 
+}
+
+namespace
+{
+template <class SharedPointer>
+struct Holder
+{
+    SharedPointer p;
+
+    Holder(const SharedPointer& p) : p(p) {}
+    Holder(const Holder& other) : p(other.p) {}
+    Holder(Holder&& other) : p(std::move(other.p)) {}
+    void operator()(...) { p.reset(); }
+};
+}
+
+template <class T>
+std::shared_ptr<T> ToStdPtr(const boost::shared_ptr<T>& p)
+{
+    return std::shared_ptr<T>(p.get(), Holder<boost::shared_ptr<T>>(p));
+}
+
+template <class T>
+std::shared_ptr<T> ToStdPtr(const std::shared_ptr<T>& p)
+{
+    return p;
 }

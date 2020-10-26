@@ -21,6 +21,8 @@ bool JointGroupPositionController::init(hardware_interface::PositionJointInterfa
 {
     nh_ = n;
 
+    ddr_.reset(new ddynamic_reconfigure::DDynamicReconfigure(n));
+
     // List of controlled joints
     std::string param_name = "joints";
     if(!n.getParam(param_name, joint_names_))
@@ -60,9 +62,41 @@ bool JointGroupPositionController::init(hardware_interface::PositionJointInterfa
 
     n.param<double>("Kp", k_p_, 0.2);
     n.param<double>("Kd", k_d_, 0.8);
-    n.param<double>("VelocityAlpha", velocity_alpha_, 1e-2);
+    ddr_->registerVariable("Kp", &k_p_, "", 0.0, 1000.0);
+    ddr_->registerVariable("Kd", &k_d_, "", 0.0, 1000.0);
+    ddr_->registerVariable("PositionSafetyFactor", &limit_position_safety_factor_, "", 0.0, 1.0);
+    ddr_->registerVariable("VelocitySafetyFactor", &limit_velocity_safety_factor_, "", 0.0, 1.0);
+    ddr_->registerVariable("AccelerationSafetyFactor", &limit_acceleration_safety_factor_, "", 0.0, 1.0);
+    ddr_->publishServicesTopics();
     
     ROS_WARN_STREAM("Kp: " << k_p_ << ", Kd: " << k_d_);
+
+    // Load validity checker if defined
+    std::vector<std::string> checkers = validity_checkers_.getDeclaredClasses();
+    std::vector<std::string> params;
+    n.getParamNames(params);
+    std::string checker_name = "";
+    for (auto name : checkers)
+    {
+        if (n.hasParam(name.substr(22)))
+        {
+            checker_name = name.substr(22);
+            break;
+        }
+    }
+    if (checker_name != "")
+    {
+        auto checker = ToStdPtr(validity_checkers_.createInstance("streaming_controllers/" + checker_name));
+        ROS_WARN_STREAM("Loading " << checker_name);
+        ros::NodeHandle nh(n, checker_name);
+        checker->init(nh);
+        validity_checker_ = checker;
+    }
+    else
+    {
+        ROS_WARN_STREAM("No validity checker defined");
+    }
+    
     
     sub_command_position_ = n.subscribe<std_msgs::Float64MultiArray>("command", 1, &JointGroupPositionController::position_command_callback, this);
     sub_command_velocity_ = n.subscribe<std_msgs::Float64MultiArray>("command_velocity", 1, &JointGroupPositionController::velocity_command_callback, this);
@@ -189,8 +223,10 @@ void JointGroupPositionController::limit_velocity_command(const std::vector<doub
     Eigen::Map<const Eigen::VectorXd> desired_velocity(_desired_velocity.data(), _desired_velocity.size());
     Eigen::Map<Eigen::VectorXd> position_command(_position_command.data(), _position_command.size());
     Eigen::Map<Eigen::VectorXd> velocity_command(_velocity_command.data(), _velocity_command.size());
-    Eigen::VectorXd position_last = Eigen::Map<Eigen::VectorXd>(command_position_.data(), command_position_.size());
-    Eigen::VectorXd velocity_last = Eigen::Map<Eigen::VectorXd>(command_velocity_.data(), command_velocity_.size());
+    std::vector<double> old_position = command_position_;
+    std::vector<double> old_velocity_ = command_velocity_;
+    Eigen::Map<const Eigen::VectorXd> position_last(old_position.data(), old_position.size());
+    Eigen::Map<const Eigen::VectorXd> velocity_last(old_velocity_.data(), old_velocity_.size());
     Eigen::Map<const Eigen::VectorXd> limit_position_min(limit_position_min_.data(), limit_position_min_.size());
     Eigen::Map<const Eigen::VectorXd> limit_position_max(limit_position_max_.data(), limit_position_max_.size());
     Eigen::Map<const Eigen::VectorXd> limit_velocity_max(limit_velocity_.data(), limit_velocity_.size());
@@ -218,12 +254,48 @@ void JointGroupPositionController::limit_velocity_command(const std::vector<doub
 
     position_command = position_last + velocity_last*dt_ + 0.5*acceleration*dt_*dt_;
     velocity_command = velocity_last + acceleration*dt_;
+    if (!is_valid(old_position, _position_command))
+    {
+        velocity_command.setZero();
+        scale = 1.0;
+        bound = -0.5*velocity_last.array().pow(2.0)/limit_acceleration_max.array();
+        for (int i=0; i<velocity_command.rows(); ++i)
+        {
+            if(position_last(i)<limit_position_min(i)+bound(i) && (velocity_last(i)<0.0 || velocity_command(i)-velocity_last(i)<0.0 ) )
+                scale = 0.0;
+            if(position_last(i)>limit_position_max(i)+bound(i) && (velocity_last(i)>0.0 || velocity_command(i)-velocity_last(i)>0.0 ) )
+                scale = 0.0;
+        }
+
+        velocity_command = scale*velocity_command - velocity_last;
+
+        acceleration = limit_acceleration(velocity_command/dt_, limit_acceleration_max);
+        w = std::min(1.0, std::max(0.0 ,divide(velocity_command/dt_, acceleration, 1e300).array().abs().minCoeff()));
+        acceleration = acceleration*w;
+
+        position_command = position_last + velocity_last*dt_ + 0.5*acceleration*dt_*dt_;
+        velocity_command = velocity_last + acceleration*dt_;
+    }
+}
+
+bool JointGroupPositionController::is_valid(const std::vector<double>& old_position, const std::vector<double>& new_posiiton)
+{
+    if (!validity_checker_)
+    {
+        return true;
+    }
+    else
+    {
+        return validity_checker_->is_valid(old_position, new_posiiton);
+    }
+    
 }
 
 void JointGroupPositionController::update(const ros::Time& /*time*/, const ros::Duration& dt)
 {
     COMMAND_TYPE command_type;
     dt_ = dt.toSec();
+    set_safety_factor(limit_position_safety_factor_, limit_velocity_safety_factor_, limit_acceleration_safety_factor_);
     {
         std::lock_guard<std::mutex> lock(command_mutex_);
         command_type = command_type_;
@@ -337,6 +409,7 @@ void JointGroupPositionController::load_safety_factor()
     nh_.param<double>("PositionSafetyFactor", limit_position_safety_factor_, 1.0);
     nh_.param<double>("VelocitySafetyFactor", limit_velocity_safety_factor_, 0.1);
     nh_.param<double>("AccelerationSafetyFactor", limit_acceleration_safety_factor_, 0.1);
+    ROS_WARN_STREAM("Safetey factors: " << limit_position_safety_factor_ << ", " << limit_velocity_safety_factor_ << ", " << limit_acceleration_safety_factor_);
     set_safety_factor(limit_position_safety_factor_, limit_velocity_safety_factor_, limit_acceleration_safety_factor_);
 }
 
@@ -363,7 +436,6 @@ void JointGroupPositionController::set_safety_factor(double p_value, double v_va
         limit_position_max_[i] = (limit_model_position_min_[i] + limit_model_position_max_[i]) * 0.5 + (limit_model_position_max_[i] - limit_model_position_min_[i]) * 0.5 * limit_position_safety_factor_;
         limit_velocity_[i] =  limit_model_velocity_[i] * limit_velocity_safety_factor_;
         limit_acceleration_[i] = limit_model_acceleration_[i] * limit_acceleration_safety_factor_;
-        ROS_WARN_STREAM(i << " " << limit_position_min_[i] << " " << limit_position_max_[i] << " " << limit_velocity_[i] << " " << limit_acceleration_[i]);
     }
 }
 
