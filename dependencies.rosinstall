@@ -1,0 +1,1 @@
+- git: {local-name: ddynamic_reconfigure, uri: 'git@github.com:pal-robotics/ddynamic_reconfigure.git'}
